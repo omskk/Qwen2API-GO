@@ -71,8 +71,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=backend-builder /out/qwen2api /usr/local/bin/qwen2api
 COPY --from=frontend-builder /src/frontend/dist ./frontend/dist
 
-RUN mkdir -p /app/data /app/logs /ms-playwright \
-    && /usr/local/bin/qwen2api --install-browsers
+RUN mkdir -p /app/data /app/logs /ms-playwright
 
 EXPOSE 7860
 
