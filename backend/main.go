@@ -8,6 +8,7 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -64,6 +65,7 @@ type App struct {
 	sessionStore      *JSONStore
 	fileContentCache  *fileContentCache
 	keepalive         *KeepAliveService
+	tokenRefresher    *TokenRefresher // Token 自动刷新服务
 }
 
 func main() {
@@ -169,6 +171,7 @@ func NewApp(settings Settings, logger *slog.Logger) (*App, error) {
 	app.client = NewQwenClient(app.accounts, settings, logger)
 	app.chatPool = NewChatIDPool(app.client, app.accounts, settings, logger)
 	app.keepalive = NewKeepAliveService(logger)
+	app.tokenRefresher = NewTokenRefresher(logger, app.client, app.accounts, app)
 	return app, nil
 }
 
@@ -179,6 +182,13 @@ func (app *App) StartBackground(ctx context.Context) {
 	app.chatPool.Start(ctx)
 	if app.keepalive != nil {
 		app.keepalive.Start(ctx, app.keepaliveConfig())
+	}
+	if app.tokenRefresher != nil {
+		app.tokenRefresher.Start(ctx, TokenRefresherConfig{
+			Enabled:         app.settings.AutoRefreshTokens,
+			IntervalSeconds: app.settings.AutoRefreshInterval,
+			ThresholdHours:  app.settings.AutoRefreshThresholdHours,
+		})
 	}
 	go func() {
 		ticker := time.NewTicker(time.Minute)
@@ -492,6 +502,25 @@ func (p *AccountPool) Remove(email string) error {
 	p.resetLocked()
 	p.mu.Unlock()
 	return p.Save()
+}
+
+// UpdateAccount 更新账号信息并保存
+func (p *AccountPool) UpdateAccount(acc *Account) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, existing := range p.accounts {
+		if existing.Email == acc.Email {
+			// 保留一些不应该被覆盖的字段
+			acc.Inflight = existing.Inflight
+			acc.RateLimits = existing.RateLimits
+			acc.LastRequestStarted = existing.LastRequestStarted
+			acc.LastRequestFinished = existing.LastRequestFinished
+			p.accounts[i] = acc
+			p.resetLocked()
+			return p.Save()
+		}
+	}
+	return errors.New("account not found")
 }
 
 func (p *AccountPool) SetMaxInflight(value int) {
@@ -1796,6 +1825,11 @@ type Settings struct {
 	KeepAliveURL                           string
 	KeepAliveInterval                      int
 
+	// Token 自动刷新配置
+	AutoRefreshTokens         bool
+	AutoRefreshInterval       int // 检查间隔(秒)
+	AutoRefreshThresholdHours int // 提前多少小时刷新
+
 	BaseDir                          string
 	DataDir                          string
 	LogsDir                          string
@@ -1856,25 +1890,30 @@ func LoadSettings() Settings {
 		LogLevel:                               envString("LOG_LEVEL", "INFO"),
 		KeepAliveURL:                           envString("KEEPALIVE_URL", ""),
 		KeepAliveInterval:                      clampInt(envInt("KEEPALIVE_INTERVAL", keepAliveDefaultInterval), keepAliveMinInterval, keepAliveMaxInterval),
-		BaseDir:                                base,
-		DataDir:                                data,
-		LogsDir:                                logs,
-		AccountsFile:                           envString("ACCOUNTS_FILE", filepath.Join(data, "accounts.json")),
-		UsersFile:                              envString("USERS_FILE", filepath.Join(data, "users.json")),
-		CapturesFile:                           envString("CAPTURES_FILE", filepath.Join(data, "captures.json")),
-		ConfigFile:                             envString("CONFIG_FILE", filepath.Join(data, "config.json")),
-		APIKeysFile:                            filepath.Join(data, "api_keys.json"),
-		ContextInlineMaxChars:                  envInt("CONTEXT_INLINE_MAX_CHARS", 4000),
-		ContextForceFileMaxChars:               envInt("CONTEXT_FORCE_FILE_MAX_CHARS", 10000),
-		ContextAttachmentTTLSeconds:            envInt("CONTEXT_ATTACHMENT_TTL_SECONDS", 1800),
-		ContextUploadParseTimeoutSeconds:       envInt("CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS", 60),
-		ContextGeneratedDir:                    envString("CONTEXT_GENERATED_DIR", filepath.Join(data, "context_files")),
-		ContextCacheFile:                       envString("CONTEXT_CACHE_FILE", filepath.Join(data, "context_cache.json")),
-		UploadedFilesFile:                      envString("UPLOADED_FILES_FILE", filepath.Join(data, "uploaded_files.json")),
-		ContextAffinityFile:                    envString("CONTEXT_AFFINITY_FILE", filepath.Join(data, "session_affinity.json")),
-		ContextAllowedGeneratedExts:            envString("CONTEXT_ALLOWED_GENERATED_EXTS", "txt,md,json,log"),
-		ContextAllowedUserExts:                 envString("CONTEXT_ALLOWED_USER_EXTS", "txt,md,json,log,xml,yaml,yml,csv,html,css,py,js,ts,java,c,cpp,cs,php,go,rb,sh,zsh,ps1,bat,cmd,pdf,doc,docx,ppt,pptx,xls,xlsx,png,jpg,jpeg,webp,gif,tiff,bmp,svg"),
-		FrontendDist:                           filepath.Join(base, "frontend", "dist"),
+
+		// Token 自动刷新配置
+		AutoRefreshTokens:                envBool("AUTO_REFRESH_TOKENS", true),
+		AutoRefreshInterval:              envInt("AUTO_REFRESH_INTERVAL", 21600),     // 默认 6 小时
+		AutoRefreshThresholdHours:        envInt("AUTO_REFRESH_THRESHOLD_HOURS", 24), // 提前 24 小时刷新
+		BaseDir:                          base,
+		DataDir:                          data,
+		LogsDir:                          logs,
+		AccountsFile:                     envString("ACCOUNTS_FILE", filepath.Join(data, "accounts.json")),
+		UsersFile:                        envString("USERS_FILE", filepath.Join(data, "users.json")),
+		CapturesFile:                     envString("CAPTURES_FILE", filepath.Join(data, "captures.json")),
+		ConfigFile:                       envString("CONFIG_FILE", filepath.Join(data, "config.json")),
+		APIKeysFile:                      filepath.Join(data, "api_keys.json"),
+		ContextInlineMaxChars:            envInt("CONTEXT_INLINE_MAX_CHARS", 4000),
+		ContextForceFileMaxChars:         envInt("CONTEXT_FORCE_FILE_MAX_CHARS", 10000),
+		ContextAttachmentTTLSeconds:      envInt("CONTEXT_ATTACHMENT_TTL_SECONDS", 1800),
+		ContextUploadParseTimeoutSeconds: envInt("CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS", 60),
+		ContextGeneratedDir:              envString("CONTEXT_GENERATED_DIR", filepath.Join(data, "context_files")),
+		ContextCacheFile:                 envString("CONTEXT_CACHE_FILE", filepath.Join(data, "context_cache.json")),
+		UploadedFilesFile:                envString("UPLOADED_FILES_FILE", filepath.Join(data, "uploaded_files.json")),
+		ContextAffinityFile:              envString("CONTEXT_AFFINITY_FILE", filepath.Join(data, "session_affinity.json")),
+		ContextAllowedGeneratedExts:      envString("CONTEXT_ALLOWED_GENERATED_EXTS", "txt,md,json,log"),
+		ContextAllowedUserExts:           envString("CONTEXT_ALLOWED_USER_EXTS", "txt,md,json,log,xml,yaml,yml,csv,html,css,py,js,ts,java,c,cpp,cs,php,go,rb,sh,zsh,ps1,bat,cmd,pdf,doc,docx,ppt,pptx,xls,xlsx,png,jpg,jpeg,webp,gif,tiff,bmp,svg"),
+		FrontendDist:                     filepath.Join(base, "frontend", "dist"),
 	}
 	if v := strings.TrimSpace(os.Getenv("API_KEYS_FILE")); v != "" {
 		settings.APIKeysFile = v
@@ -2311,6 +2350,348 @@ func (s *KeepAliveService) Status() map[string]any {
 	}
 }
 
+// ============================================================================
+// TokenRefresher - Token 自动刷新服务
+// ============================================================================
+
+type TokenRefresherConfig struct {
+	Enabled         bool
+	IntervalSeconds int
+	ThresholdHours  int
+}
+
+type TokenRefresher struct {
+	logger *slog.Logger
+	client *QwenClient
+	pool   *AccountPool
+	app    *App
+
+	mu         sync.Mutex
+	parent     context.Context
+	cancel     context.CancelFunc
+	running    bool
+	config     TokenRefresherConfig
+	lastRun    time.Time
+	lastResult *TokenRefreshResult
+}
+
+type TokenRefreshResult struct {
+	Total      int
+	Refreshed  int
+	Failed     int
+	Errors     []string
+	StartedAt  time.Time
+	FinishedAt time.Time
+}
+
+func NewTokenRefresher(logger *slog.Logger, client *QwenClient, pool *AccountPool, app *App) *TokenRefresher {
+	return &TokenRefresher{
+		logger: logger,
+		client: client,
+		pool:   pool,
+		app:    app,
+	}
+}
+
+func (r *TokenRefresher) Start(parent context.Context, cfg TokenRefresherConfig) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.parent = parent
+	r.mu.Unlock()
+	r.Apply(cfg)
+}
+
+func (r *TokenRefresher) Apply(cfg TokenRefresherConfig) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.cancel != nil {
+		r.cancel()
+		r.cancel = nil
+	}
+	parent := r.parent
+	if parent == nil {
+		parent = context.Background()
+	}
+	r.config = cfg
+	if !cfg.Enabled || cfg.IntervalSeconds <= 0 {
+		r.running = false
+		r.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(parent)
+	r.cancel = cancel
+	r.running = true
+	interval := time.Duration(cfg.IntervalSeconds) * time.Second
+	r.mu.Unlock()
+
+	go r.run(ctx, interval)
+}
+
+func (r *TokenRefresher) Stop() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.cancel != nil {
+		r.cancel()
+		r.cancel = nil
+	}
+	r.running = false
+	r.mu.Unlock()
+}
+
+func (r *TokenRefresher) run(ctx context.Context, interval time.Duration) {
+	// 启动时稍微延迟一下，避免与其他初始化冲突
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(30 * time.Second):
+	}
+
+	// 立即执行一次
+	r.executeRefresh(ctx)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			r.mu.Lock()
+			r.running = false
+			r.mu.Unlock()
+			return
+		case <-ticker.C:
+			r.executeRefresh(ctx)
+		}
+	}
+}
+
+func (r *TokenRefresher) executeRefresh(ctx context.Context) {
+	if r.client == nil || r.pool == nil || r.app == nil {
+		return
+	}
+
+	result := &TokenRefreshResult{
+		StartedAt: time.Now(),
+	}
+
+	accounts := r.pool.Snapshot()
+	if len(accounts) == 0 {
+		return
+	}
+
+	var needsRefresh []*Account
+	now := time.Now().Unix()
+	thresholdSeconds := int64(r.config.ThresholdHours) * 3600
+
+	for _, acc := range accounts {
+		// 只处理有密码的账号（可以自动重新登录）
+		if acc.Password == "" || acc.Email == "" {
+			continue
+		}
+
+		// 检查 token 是否即将过期或已过期
+		// 使用 JWT 解析 token 过期时间
+		if acc.Token == "" {
+			// 没有 token，需要登录
+			needsRefresh = append(needsRefresh, &acc)
+			continue
+		}
+
+		// 尝试解析 JWT 获取过期时间
+		exp := r.extractTokenExpiry(acc.Token)
+		if exp == 0 {
+			// 无法解析，可能是无效 token
+			needsRefresh = append(needsRefresh, &acc)
+			continue
+		}
+
+		if exp <= now+thresholdSeconds {
+			// token 即将过期或已过期
+			needsRefresh = append(needsRefresh, &acc)
+		}
+	}
+
+	result.Total = len(needsRefresh)
+	if result.Total == 0 {
+		r.logger.Info("Token 自动刷新：没有需要刷新的账号", "threshold_hours", r.config.ThresholdHours)
+		r.mu.Lock()
+		r.lastResult = result
+		r.mu.Unlock()
+		return
+	}
+
+	r.logger.Info("Token 自动刷新：开始检查", "need_refresh", result.Total, "threshold_hours", r.config.ThresholdHours)
+
+	for _, acc := range needsRefresh {
+		select {
+		case <-ctx.Done():
+			r.mu.Lock()
+			r.lastResult = result
+			r.mu.Unlock()
+			return
+		default:
+		}
+
+		err := r.refreshAccountToken(ctx, acc)
+		if err != nil {
+			result.Failed++
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", acc.Email, err))
+			r.logger.Warn("Token 自动刷新失败", "account", acc.Email, "error", err)
+		} else {
+			result.Refreshed++
+			r.logger.Info("Token 自动刷新成功", "account", acc.Email)
+		}
+
+		// 避免请求过于频繁
+		select {
+		case <-ctx.Done():
+			r.mu.Lock()
+			r.lastResult = result
+			r.mu.Unlock()
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	result.FinishedAt = time.Now()
+	r.mu.Lock()
+	r.lastResult = result
+	r.lastRun = time.Now()
+	r.mu.Unlock()
+
+	r.logger.Info("Token 自动刷新完成",
+		"total", result.Total,
+		"refreshed", result.Refreshed,
+		"failed", result.Failed,
+		"duration", result.FinishedAt.Sub(result.StartedAt).String())
+}
+
+// extractTokenExpiry 从 JWT token 中提取过期时间
+func (r *TokenRefresher) extractTokenExpiry(token string) int64 {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return 0
+	}
+	// JWT payload 是第二部分，需要 base64 解码
+	payload := parts[1]
+	// 补齐 padding
+	if m := len(payload) % 4; m != 0 {
+		payload += strings.Repeat("=", 4-m)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		return 0
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return 0
+	}
+	if exp, ok := claims["exp"].(float64); ok {
+		return int64(exp)
+	}
+	return 0
+}
+
+func (r *TokenRefresher) refreshAccountToken(ctx context.Context, acc *Account) error {
+	if r.app == nil || r.app.client == nil {
+		return fmt.Errorf("app or client not initialized")
+	}
+
+	// 使用浏览器自动化重新登录获取新 token
+	var newToken string
+	var newCookies string
+	err := r.app.withBrowser(ctx, func(page pw.Page) error {
+		token := loginAndGetToken(ctx, page, acc.Email, acc.Password, 60*time.Second)
+		if token != "" {
+			newToken = token
+			// 获取 cookies
+			newCookies = qwenCookieString(page)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("browser automation failed: %w", err)
+	}
+
+	if newToken == "" {
+		return fmt.Errorf("failed to get new token from login")
+	}
+
+	// 验证新 token
+	verify := r.client.VerifyTokenDetail(ctx, newToken)
+	if !verify.Valid {
+		return fmt.Errorf("new token verification failed: %s", verify.Error)
+	}
+
+	// 更新账号信息
+	acc.Token = newToken
+	if newCookies != "" {
+		acc.Cookies = newCookies
+	}
+	acc.Valid = true
+	acc.StatusCode = "valid"
+	acc.LastError = ""
+	acc.ActivationPending = false
+
+	// 保存到账号池
+	if err := r.pool.UpdateAccount(acc); err != nil {
+		return fmt.Errorf("failed to save updated account: %w", err)
+	}
+
+	return nil
+}
+
+func (r *TokenRefresher) Status() map[string]any {
+	if r == nil {
+		return map[string]any{"running": false}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	status := map[string]any{
+		"running":       r.running,
+		"enabled":       r.config.Enabled,
+		"interval":      r.config.IntervalSeconds,
+		"threshold_hrs": r.config.ThresholdHours,
+		"last_run":      r.lastRun.Unix(),
+	}
+	if r.lastResult != nil {
+		status["last_result"] = map[string]any{
+			"total":       r.lastResult.Total,
+			"refreshed":   r.lastResult.Refreshed,
+			"failed":      r.lastResult.Failed,
+			"errors":      r.lastResult.Errors,
+			"started_at":  r.lastResult.StartedAt.Unix(),
+			"finished_at": r.lastResult.FinishedAt.Unix(),
+		}
+	}
+	return status
+}
+
+// RefreshAccountToken 公开方法：手动刷新单个账号的 token
+func (r *TokenRefresher) RefreshAccountToken(ctx context.Context, acc *Account) error {
+	if r == nil {
+		return fmt.Errorf("token refresher not initialized")
+	}
+	return r.refreshAccountToken(ctx, acc)
+}
+
+// 手动触发一次刷新
+func (r *TokenRefresher) TriggerRefresh(ctx context.Context) *TokenRefreshResult {
+	if r == nil || !r.config.Enabled {
+		return &TokenRefreshResult{Errors: []string{"refresher not enabled"}}
+	}
+	r.executeRefresh(ctx)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastResult
+}
+
 func (app *App) keepaliveConfig() KeepAliveConfig {
 	cfg := KeepAliveConfig{URL: app.settings.KeepAliveURL, Interval: app.settings.KeepAliveInterval}
 	if cfg.Interval <= 0 {
@@ -2427,6 +2808,11 @@ func (app *App) routes() http.Handler {
 	mux.HandleFunc("POST /api/admin/verify", app.adminVerifyAll)
 	mux.HandleFunc("POST /api/admin/accounts/{email}/activate", app.adminActivateAccount)
 	mux.HandleFunc("POST /api/admin/accounts/{email}/verify", app.adminVerifyAccount)
+	mux.HandleFunc("POST /api/admin/accounts/{email}/refresh-token", app.adminRefreshAccountToken)
+	mux.HandleFunc("GET /api/admin/token-refresher/status", app.adminTokenRefreshStatus)
+	mux.HandleFunc("POST /api/admin/token-refresher/trigger", app.adminTokenRefreshTrigger)
+	mux.HandleFunc("GET /api/admin/token-refresher/config", app.adminTokenRefreshConfig)
+	mux.HandleFunc("PUT /api/admin/token-refresher/config", app.adminTokenRefreshConfig)
 	mux.HandleFunc("DELETE /api/admin/accounts/{email}", app.adminDeleteAccount)
 	mux.HandleFunc("GET /api/admin/settings", app.adminGetSettings)
 	mux.HandleFunc("PUT /api/admin/settings", app.adminUpdateSettings)
@@ -6535,6 +6921,116 @@ func (app *App) adminVerifyAccount(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeError(w, http.StatusNotFound, "Account not found")
+}
+
+func (app *App) adminRefreshAccountToken(w http.ResponseWriter, r *http.Request) {
+	if _, ok := app.verifyAdmin(w, r); !ok {
+		return
+	}
+	email := r.PathValue("email")
+	for _, acc := range app.accounts.Snapshot() {
+		if acc.Email == email {
+			if acc.Password == "" {
+				writeError(w, http.StatusBadRequest, "Account has no password, cannot auto-refresh token")
+				return
+			}
+			if app.tokenRefresher == nil {
+				writeError(w, http.StatusInternalServerError, "Token refresher not initialized")
+				return
+			}
+			err := app.tokenRefresher.RefreshAccountToken(r.Context(), &acc)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to refresh token: %v", err))
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "email": email, "message": "Token refreshed successfully"})
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "Account not found")
+}
+
+func (app *App) adminTokenRefreshStatus(w http.ResponseWriter, r *http.Request) {
+	if _, ok := app.verifyAdmin(w, r); !ok {
+		return
+	}
+	if app.tokenRefresher == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"running": false, "error": "token refresher not initialized"})
+		return
+	}
+	writeJSON(w, http.StatusOK, app.tokenRefresher.Status())
+}
+
+func (app *App) adminTokenRefreshTrigger(w http.ResponseWriter, r *http.Request) {
+	if _, ok := app.verifyAdmin(w, r); !ok {
+		return
+	}
+	if app.tokenRefresher == nil {
+		writeError(w, http.StatusInternalServerError, "token refresher not initialized")
+		return
+	}
+	result := app.tokenRefresher.TriggerRefresh(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        len(result.Errors) == 0,
+		"total":     result.Total,
+		"refreshed": result.Refreshed,
+		"failed":    result.Failed,
+		"errors":    result.Errors,
+	})
+}
+
+func (app *App) adminTokenRefreshConfig(w http.ResponseWriter, r *http.Request) {
+	if _, ok := app.verifyAdmin(w, r); !ok {
+		return
+	}
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled":          app.settings.AutoRefreshTokens,
+			"interval_seconds": app.settings.AutoRefreshInterval,
+			"threshold_hours":  app.settings.AutoRefreshThresholdHours,
+		})
+		return
+	}
+	if r.Method == http.MethodPut {
+		var body map[string]any
+		if err := decodeJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, "Invalid JSON body")
+			return
+		}
+		data := map[string]any{}
+		if app.configStore != nil {
+			_ = app.configStore.LoadInto(&data)
+		}
+		if v, ok := body["enabled"].(bool); ok {
+			app.settings.AutoRefreshTokens = v
+			data["auto_refresh_tokens"] = v
+		}
+		if v, ok := body["interval_seconds"].(float64); ok {
+			app.settings.AutoRefreshInterval = int(v)
+			data["auto_refresh_interval"] = int(v)
+		}
+		if v, ok := body["threshold_hours"].(float64); ok {
+			app.settings.AutoRefreshThresholdHours = int(v)
+			data["auto_refresh_threshold_hours"] = int(v)
+		}
+		if app.configStore != nil {
+			if err := app.configStore.Save(data); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+		// 重新应用配置
+		if app.tokenRefresher != nil {
+			app.tokenRefresher.Apply(TokenRefresherConfig{
+				Enabled:         app.settings.AutoRefreshTokens,
+				IntervalSeconds: app.settings.AutoRefreshInterval,
+				ThresholdHours:  app.settings.AutoRefreshThresholdHours,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 }
 
 func (app *App) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {

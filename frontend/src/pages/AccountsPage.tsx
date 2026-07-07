@@ -376,6 +376,8 @@ export default function AccountsPage() {
   const [serviceFilter, setServiceFilter] = useState("all")
   const [planFilter, setPlanFilter] = useState("all")
   const [selected, setSelected] = useState<Set<string>>(() => new Set())
+  const [refreshingToken, setRefreshingToken] = useState<Set<string>>(() => new Set())
+  const [refreshingTokenAll, setRefreshingTokenAll] = useState(false)
   const importFileInputRef = useRef<HTMLInputElement | null>(null)
   const deferredQuery = useDeferredValue(query)
 
@@ -636,6 +638,59 @@ export default function AccountsPage() {
       }
     }
     toast.success(`刷新完成：通过 ${ok}，失败 ${failed}`, { id, duration: 8000 })
+    fetchAccounts()
+  }
+
+  const handleRefreshToken = (targetEmail: string) => {
+    if (!requireSessionKey()) return
+    setRefreshingToken(prev => new Set(prev).add(targetEmail))
+    const id = toast.loading(`正在刷新 ${targetEmail} 的 Token...`)
+    fetch(`${API_BASE}/api/admin/accounts/${encodeURIComponent(targetEmail)}/refresh-token`, {
+      method: "POST",
+      headers: getAuthHeader(),
+    }).then(readAdminJSON)
+      .then(data => {
+        if (data.ok && data.refreshed) {
+          toast.success(`Token 刷新成功：${targetEmail}`, { id })
+        } else {
+          toast.error(data.error || `Token 刷新失败：${targetEmail}`, { id, duration: 8000 })
+        }
+        fetchAccounts()
+      })
+      .catch(err => toast.error(err instanceof Error ? err.message : "刷新 Token 请求失败", { id }))
+      .finally(() => setRefreshingToken(prev => {
+        const next = new Set(prev)
+        next.delete(targetEmail)
+        return next
+      }))
+  }
+
+  const handleRefreshTokenSelected = async () => {
+    if (!requireSessionKey()) return
+    const refresableAccounts = selectedAccounts.filter(acc => acc.source !== "env" && acc.password)
+    if (!refresableAccounts.length) {
+      toast.error("选中账号中没有可刷新 Token 的（需有密码）")
+      return
+    }
+    setRefreshingTokenAll(true)
+    const id = toast.loading(`正在刷新 ${refresableAccounts.length} 个选中账号的 Token...`)
+    let ok = 0
+    let failed = 0
+    for (const acc of refresableAccounts) {
+      try {
+        const res = await fetch(`${API_BASE}/api/admin/accounts/${encodeURIComponent(acc.email)}/refresh-token`, {
+          method: "POST",
+          headers: getAuthHeader(),
+        })
+        const data = await res.json().catch(() => ({}))
+        if (res.ok && data.refreshed) ok += 1
+        else failed += 1
+      } catch {
+        failed += 1
+      }
+    }
+    toast.success(`Token 刷新完成：成功 ${ok}，失败 ${failed}（无密码的账号不可刷新）`, { id, duration: 8000 })
+    setRefreshingTokenAll(false)
     fetchAccounts()
   }
 
@@ -925,6 +980,9 @@ export default function AccountsPage() {
             <Button variant="ghost" size="sm" onClick={handleVerifySelected} disabled={!selectedAccounts.length}>
               <RefreshCw className="mr-2 size-4" /> 刷新选中 GPT 账号信息和额度
             </Button>
+            <Button variant="ghost" size="sm" onClick={handleRefreshTokenSelected} disabled={!selectedAccounts.length || refreshingTokenAll}>
+              <RotateCw className={`mr-2 size-4 ${refreshingTokenAll ? "animate-spin" : ""}`} /> 刷新选中 Token
+            </Button>
             <Button variant="ghost" size="sm" onClick={handleDeleteSelected} disabled={!selectedAccounts.length} className="text-rose-600 hover:text-rose-600">
               <Trash2 className="mr-2 size-4" /> 删除所选
             </Button>
@@ -1022,6 +1080,9 @@ export default function AccountsPage() {
                       </IconButton>
                       <IconButton title="刷新 / 验证" onClick={() => handleVerify(acc.email)} disabled={verifying === acc.email}>
                         {verifying === acc.email ? <RefreshCw className="size-4 animate-spin" /> : <RotateCw className="size-4" />}
+                      </IconButton>
+                      <IconButton title="刷新 Token（用密码重新登录）" onClick={() => handleRefreshToken(acc.email)} disabled={refreshingToken.has(acc.email)}>
+                        <RotateCw className={`size-4 ${refreshingToken.has(acc.email) ? "animate-spin" : ""}`} />
                       </IconButton>
                       <IconButton title={acc.source === "env" ? "环境变量账号需要从环境变量中移除" : "删除"} onClick={() => handleDelete(acc)} disabled={acc.source === "env"} danger>
                         <Trash2 className="size-4" />
